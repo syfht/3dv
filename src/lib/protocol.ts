@@ -18,7 +18,8 @@ export const LINK_TIMEOUT_MS = 30_000;
 /** Worlds nobody has visited for this long are replaced by a fresh one. */
 export const WORLD_IDLE_MS = 30 * 60_000;
 
-export type AttackKind = "punch" | "kick" | "combo";
+/** Which GLB clip an attacking player is playing: Skill_06 / Combo_02 / Guard_Counter. */
+export type AttackKind = "skill" | "combo" | "guard";
 
 export type Pose = {
   x: number;
