@@ -2,13 +2,14 @@ import * as THREE from "three";
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import type { RemotePose } from "@/lib/multiplayer";
 import { HURT_FLASH_MS } from "@/lib/protocol";
-import type { AttackKind } from "@/lib/protocol";
+import type { AttackKind, LocomotionKind } from "@/lib/protocol";
 import type { ItemType } from "./inventory";
 import {
   CLIPS,
   createCharacterAnimator,
   randomDamageClip,
   type CharacterAnimator,
+  type LocomotionClip,
 } from "./characterAnimator";
 
 // Other players in the world. They use the same character model as the local
@@ -17,8 +18,20 @@ import {
 
 const ATTACK_CLIP: Record<AttackKind, string> = {
   skill: CLIPS.skill,
-  combo: CLIPS.combo,
-  guard: CLIPS.guardCounter,
+  combo1: CLIPS.combo1,
+  combo2: CLIPS.combo2,
+  combo3: CLIPS.combo3,
+  combo31: CLIPS.combo31,
+  guardCounter: CLIPS.guardCounter,
+  guard: CLIPS.guard,
+  roll: CLIPS.roll,
+};
+
+const LOCOMOTION_CLIP: Record<LocomotionKind, LocomotionClip> = {
+  idle: CLIPS.idle,
+  walk: CLIPS.walk,
+  backWalk: CLIPS.backWalk,
+  run: CLIPS.run,
 };
 
 function findBone(root: THREE.Object3D, partial: string) {
@@ -57,6 +70,7 @@ type Avatar = {
   target: THREE.Vector3;
   targetYaw: number;
   moving: boolean;
+  locomotion: LocomotionKind;
   attack: AttackKind | null;
   name: string;
   hand: THREE.Object3D | null;
@@ -163,6 +177,7 @@ export function createRemotePlayers(
       target: new THREE.Vector3(),
       targetYaw: 0,
       moving: false,
+      locomotion: "idle",
       attack: null,
       name,
       hand: null,
@@ -220,6 +235,7 @@ export function createRemotePlayers(
       avatar.target.set(player.x, networkY, player.z);
       avatar.targetYaw = player.ry;
       avatar.moving = player.moving;
+      avatar.locomotion = player.locomotion ?? (player.moving ? "walk" : "idle");
       // A newly reported attack starts the matching clip on this avatar.
       const attack = player.attack ?? null;
       if (attack && attack !== avatar.attack && avatar.deadUntil <= performance.now()) {
@@ -312,7 +328,7 @@ export function createRemotePlayers(
         avatar.animator?.release();
       }
       if (!avatar.deadUntil) {
-        avatar.animator?.setLocomotion(avatar.moving ? CLIPS.walk : CLIPS.idle);
+        avatar.animator?.setLocomotion(LOCOMOTION_CLIP[avatar.locomotion] ?? CLIPS.idle);
       }
       avatar.animator?.update(delta);
     }
