@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { MODEL_URL, createModelLoader } from "@/assets/model";
+import { CLIPS, createCharacterAnimator, type CharacterAnimator } from "./characterAnimator";
 
 // Small slowly-rotating render of the player character for menu panels.
 export default function PlayerPreview() {
@@ -29,11 +30,14 @@ export default function PlayerPreview() {
     scene.add(key);
 
     let model: THREE.Object3D | undefined;
+    let animator: CharacterAnimator | undefined;
     let disposed = false;
     createModelLoader().load(MODEL_URL, (gltf) => {
       if (disposed) return;
       host.dataset["loaded"] = "true";
       model = gltf.scene;
+      animator = createCharacterAnimator(model, gltf.animations);
+      animator.setLocomotion(CLIPS.idle, 0);
       const box = new THREE.Box3().setFromObject(model);
       const size = box.getSize(new THREE.Vector3());
       const scale = 1.72 / Math.max(size.y, 0.001);
@@ -46,8 +50,11 @@ export default function PlayerPreview() {
     });
 
     let raf = 0;
+    const clock = new THREE.Clock();
     const tick = () => {
       raf = requestAnimationFrame(tick);
+      const delta = Math.min(clock.getDelta(), 0.05);
+      animator?.update(delta);
       if (model) model.rotation.y += 0.01;
       renderer.render(scene, camera);
     };
@@ -66,6 +73,7 @@ export default function PlayerPreview() {
 
     return () => {
       disposed = true;
+      animator?.dispose();
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
       renderer.dispose();
