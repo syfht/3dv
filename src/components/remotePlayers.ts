@@ -2,26 +2,24 @@ import * as THREE from "three";
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import type { RemotePose } from "@/lib/multiplayer";
 import { HURT_FLASH_MS } from "@/lib/protocol";
+import type { AttackKind } from "@/lib/protocol";
 import type { ItemType } from "./inventory";
+import {
+  CLIPS,
+  createCharacterAnimator,
+  randomDamageClip,
+  type CharacterAnimator,
+} from "./characterAnimator";
 
 // Other players in the world. They use the same character model as the local
-// player (cloned once it has finished loading), with a walk cycle and the same
-// punch / combo / kick keyframes the local character uses.
+// player (cloned once it has finished loading) and the same animation clips
+// baked into the GLB.
 
-const BONE_NAMES = {
-  leftUpperArm: "L_Arm1_",
-  rightUpperArm: "R_Arm1_",
-  leftLowerArm: "L_Arm2_",
-  rightLowerArm: "R_Arm2_",
-  leftUpperLeg: "L_Leg1_",
-  rightUpperLeg: "R_Leg1_",
-  leftLowerLeg: "L_Leg2_",
-  rightLowerLeg: "R_Leg2_",
-} as const;
-
-type LimbKey = keyof typeof BONE_NAMES;
-type Limbs = Partial<Record<LimbKey, THREE.Object3D>>;
-type PoseMap = Map<THREE.Object3D, THREE.Quaternion>;
+const ATTACK_CLIP: Record<AttackKind, string> = {
+  skill: CLIPS.skill,
+  combo: CLIPS.combo,
+  guard: CLIPS.guardCounter,
+};
 
 function findBone(root: THREE.Object3D, partial: string) {
   let found: THREE.Object3D | undefined;
@@ -51,106 +49,15 @@ function nameTexture(text: string) {
   return texture;
 }
 
-// Aim a limb bone at a world-space direction, storing the result in `store`.
-function aimBone(
-  root: THREE.Object3D,
-  bone: THREE.Object3D | undefined,
-  makeTarget: (side: number) => THREE.Vector3,
-  store: PoseMap,
-) {
-  if (!bone || !bone.parent) return;
-  const childBone = bone.children.find((child) => (child as THREE.Bone).isBone);
-  if (!childBone) return;
-  root.updateMatrixWorld(true);
-  const origin = bone.getWorldPosition(new THREE.Vector3());
-  const direction = childBone.getWorldPosition(new THREE.Vector3()).sub(origin).normalize();
-  const side = direction.x >= 0 ? 1 : -1;
-  const target = makeTarget(side).normalize();
-  const worldDelta = new THREE.Quaternion().setFromUnitVectors(direction, target);
-  const parentWorld = bone.parent.getWorldQuaternion(new THREE.Quaternion());
-  const currentLocal = bone.quaternion.clone();
-  bone.quaternion
-    .copy(parentWorld)
-    .invert()
-    .multiply(worldDelta)
-    .multiply(parentWorld)
-    .multiply(currentLocal);
-  bone.updateMatrixWorld(true);
-  store.set(bone, bone.quaternion.clone());
-}
-
-type Aim = [THREE.Object3D | undefined, (side: number) => THREE.Vector3];
-
-function capturePose(root: THREE.Object3D, aims: Aim[]) {
-  const pose: PoseMap = new Map();
-  const saved: PoseMap = new Map();
-  aims.forEach(([bone]) => { if (bone) saved.set(bone, bone.quaternion.clone()); });
-  aims.forEach(([bone, target]) => aimBone(root, bone, target, pose));
-  saved.forEach((quaternion, bone) => bone.quaternion.copy(quaternion));
-  root.updateMatrixWorld(true);
-  return pose;
-}
-
-type AttackPoses = {
-  windup: PoseMap;
-  strike: PoseMap;
-  jabWindup: PoseMap;
-  jabStrike: PoseMap;
-  kickWindup: PoseMap;
-  kickStrike: PoseMap;
-};
-
-// Same keyframes the local character uses, rebuilt for this clone's skeleton.
-function buildAttackPoses(root: THREE.Object3D, limbs: Limbs): AttackPoses {
-  return {
-    windup: capturePose(root, [
-      [limbs.rightUpperArm, (side) => new THREE.Vector3(side * 0.55, -0.4, -0.6)],
-      [limbs.rightLowerArm, (side) => new THREE.Vector3(-side * 0.7, 0.15, 0.2)],
-      [limbs.leftUpperArm, (side) => new THREE.Vector3(side * 0.7, -0.35, 0.4)],
-      [limbs.leftLowerArm, (side) => new THREE.Vector3(-side * 0.15, 0.05, 0.95)],
-    ]),
-    strike: capturePose(root, [
-      [limbs.rightUpperArm, (side) => new THREE.Vector3(side * 0.26, -0.14, 0.95)],
-      [limbs.rightLowerArm, (side) => new THREE.Vector3(side * 0.06, -0.06, 1)],
-      [limbs.leftUpperArm, (side) => new THREE.Vector3(side * 0.62, -0.45, -0.4)],
-      [limbs.leftLowerArm, (side) => new THREE.Vector3(-side * 0.4, -0.1, -0.3)],
-    ]),
-    jabWindup: capturePose(root, [
-      [limbs.leftUpperArm, (side) => new THREE.Vector3(side * 0.42, -0.5, -0.62)],
-      [limbs.leftLowerArm, (side) => new THREE.Vector3(-side * 0.6, 0.12, 0.32)],
-      [limbs.rightUpperArm, (side) => new THREE.Vector3(side * 0.45, -0.62, 0.3)],
-      [limbs.rightLowerArm, (side) => new THREE.Vector3(-side * 0.5, 0.2, 0.55)],
-    ]),
-    jabStrike: capturePose(root, [
-      [limbs.leftUpperArm, (side) => new THREE.Vector3(side * 0.14, -0.1, 0.98)],
-      [limbs.leftLowerArm, (side) => new THREE.Vector3(side * 0.04, -0.04, 1)],
-      [limbs.rightUpperArm, (side) => new THREE.Vector3(side * 0.45, -0.62, 0.3)],
-      [limbs.rightLowerArm, (side) => new THREE.Vector3(-side * 0.5, 0.2, 0.55)],
-    ]),
-    kickWindup: capturePose(root, [
-      [limbs.rightUpperLeg, () => new THREE.Vector3(0, -0.2, 0.98)],
-      [limbs.rightLowerLeg, () => new THREE.Vector3(0, -0.85, -0.5)],
-    ]),
-    kickStrike: capturePose(root, [
-      [limbs.rightUpperLeg, () => new THREE.Vector3(0, 0.12, 0.99)],
-      [limbs.rightLowerLeg, () => new THREE.Vector3(0, 0.05, 1)],
-    ]),
-  };
-}
-
 type Avatar = {
   group: THREE.Group;
   sprite: THREE.Sprite;
   body: THREE.Object3D | null;
-  limbs: Limbs;
-  rest: PoseMap;
-  poses: AttackPoses | null;
+  animator: CharacterAnimator | null;
   target: THREE.Vector3;
   targetYaw: number;
-  walk: number;
   moving: boolean;
-  attack: RemotePose["attack"];
-  attackProgress: number;
+  attack: AttackKind | null;
   name: string;
   hand: THREE.Object3D | null;
   handScale: number;
@@ -161,6 +68,8 @@ type Avatar = {
   tint: { material: THREE.MeshStandardMaterial; color: THREE.Color; emissive: THREE.Color }[];
   hurtUntil: number;
   tinted: boolean;
+  /** While set, this avatar is playing Dead_A and ignores other animations. */
+  deadUntil: number;
 };
 
 const HURT_COLOR = new THREE.Color(0xff2a2a);
@@ -172,10 +81,13 @@ export function createRemotePlayers(
 ) {
   const avatars = new Map<string, Avatar>();
   let template: THREE.Object3D | null = null;
+  let templateClips: THREE.AnimationClip[] = [];
 
   const attachBody = (avatar: Avatar) => {
     if (!template) return;
     if (avatar.body) avatar.group.remove(avatar.body);
+    avatar.animator?.dispose();
+    avatar.animator = null;
     const body = cloneSkinned(template);
     // Clone the materials so this avatar can flash red on its own.
     avatar.tint = [];
@@ -202,15 +114,8 @@ export function createRemotePlayers(
     });
     avatar.group.add(body);
     avatar.body = body;
-    avatar.limbs = {};
-    avatar.rest = new Map();
-    for (const [key, prefix] of Object.entries(BONE_NAMES) as [LimbKey, string][]) {
-      const bone = findBone(body, prefix);
-      if (!bone) continue;
-      avatar.limbs[key] = bone;
-      avatar.rest.set(bone, bone.quaternion.clone());
-    }
-    avatar.poses = buildAttackPoses(body, avatar.limbs);
+    avatar.animator = createCharacterAnimator(body, templateClips);
+    avatar.animator.setLocomotion(CLIPS.idle, 0);
     const handBone = findBone(body, "R_Hand_Attach") ?? findBone(body, "R_Hand_");
     avatar.hand = handBone ?? null;
     avatar.handScale = handBone
@@ -254,15 +159,11 @@ export function createRemotePlayers(
       group,
       sprite,
       body: null,
-      limbs: {},
-      rest: new Map(),
-      poses: null,
+      animator: null,
       target: new THREE.Vector3(),
       targetYaw: 0,
-      walk: 0,
       moving: false,
       attack: null,
-      attackProgress: 0,
       name,
       hand: null,
       handScale: 1,
@@ -272,6 +173,7 @@ export function createRemotePlayers(
       tint: [],
       hurtUntil: 0,
       tinted: false,
+      deadUntil: 0,
     };
     attachBody(avatar);
     avatars.set(id, avatar);
@@ -279,14 +181,16 @@ export function createRemotePlayers(
   };
 
   // Called once the local character model has finished loading.
-  const setTemplate = (model: THREE.Object3D) => {
+  const setTemplate = (model: THREE.Object3D, clips: THREE.AnimationClip[] = []) => {
     template = model;
+    templateClips = clips;
     for (const avatar of avatars.values()) attachBody(avatar);
   };
 
   const remove = (id: string) => {
     const avatar = avatars.get(id);
     if (!avatar) return;
+    avatar.animator?.dispose();
     scene.remove(avatar.group);
     avatar.sprite.material.map?.dispose();
     avatar.sprite.material.dispose();
@@ -316,8 +220,13 @@ export function createRemotePlayers(
       avatar.target.set(player.x, networkY, player.z);
       avatar.targetYaw = player.ry;
       avatar.moving = player.moving;
-      avatar.attack = player.attack ?? null;
-      avatar.attackProgress = player.ap ?? 0;
+      // A newly reported attack starts the matching clip on this avatar.
+      const attack = player.attack ?? null;
+      if (attack && attack !== avatar.attack && avatar.deadUntil <= performance.now()) {
+        const clip = ATTACK_CLIP[attack];
+        if (clip) avatar.animator?.play(clip, { priority: 1 });
+      }
+      avatar.attack = attack;
       setItem(avatar, player.item ?? null);
     }
     for (const id of [...avatars.keys()]) if (!seen.has(id)) remove(id);
@@ -344,14 +253,23 @@ export function createRemotePlayers(
     return best?.id ?? null;
   };
 
-  const swingAxis = new THREE.Vector3(1, 0, 0);
-  const swingQuaternion = new THREE.Quaternion();
-  const targetQuaternion = new THREE.Quaternion();
-
-  // Flash a player red (Minecraft-style hurt tint).
+  // Flash a player red and play one of the model's damage reactions.
   const flash = (id: string) => {
     const avatar = avatars.get(id);
-    if (avatar) avatar.hurtUntil = performance.now() + HURT_FLASH_MS;
+    if (!avatar) return;
+    avatar.hurtUntil = performance.now() + HURT_FLASH_MS;
+    if (avatar.deadUntil > performance.now()) return; // already collapsing
+    avatar.animator?.play(randomDamageClip(), { priority: 2 });
+  };
+
+  // Another player ran out of health: play Dead_A and hold the last frame
+  // until the clip has run, then blend back for their respawn.
+  const die = (id: string) => {
+    const avatar = avatars.get(id);
+    if (!avatar?.animator) return;
+    const length = avatar.animator.play(CLIPS.dead, { priority: 3, hold: true });
+    avatar.attack = null;
+    avatar.deadUntil = performance.now() + (length || 1.2) * 1000;
   };
 
   const update = (delta: number, groundHeight?: (x: number, z: number, y: number) => number) => {
@@ -388,67 +306,15 @@ export function createRemotePlayers(
       while (diff < -Math.PI) diff += Math.PI * 2;
       avatar.group.rotation.y += diff * blend;
 
-      // Attack layer: same two-keyframe timing as the local character.
-      let attackBlend = 0;
-      let segmentT = 0;
-      let poseA: PoseMap | undefined;
-      let poseB: PoseMap | undefined;
-      const poses = avatar.poses;
-      if (poses && avatar.attack) {
-        const p = THREE.MathUtils.clamp(avatar.attackProgress, 0, 1);
-        if (avatar.attack === "kick") {
-          poseA = poses.kickWindup; poseB = poses.kickStrike;
-          if (p < 0.3) { segmentT = p / 0.3; attackBlend = Math.min(1, segmentT * 1.4); }
-          else if (p < 0.48) { segmentT = 1 + (p - 0.3) / 0.18; attackBlend = 1; }
-          else if (p < 0.62) { segmentT = 2; attackBlend = 1; }
-          else { segmentT = 2; attackBlend = (1 - p) / 0.38; }
-        } else if (avatar.attack === "combo") {
-          if (p < 0.12) { poseA = poses.jabWindup; poseB = poses.jabStrike; segmentT = p / 0.12; attackBlend = segmentT; }
-          else if (p < 0.3) { poseA = poses.jabWindup; poseB = poses.jabStrike; segmentT = 1 + (p - 0.12) / 0.18; attackBlend = 1; }
-          else if (p < 0.45) { poseA = poses.jabWindup; poseB = poses.jabStrike; segmentT = 2; attackBlend = 1; }
-          else if (p < 0.58) { poseA = poses.windup; poseB = poses.strike; segmentT = (p - 0.45) / 0.13; attackBlend = 1; }
-          else if (p < 0.74) { poseA = poses.windup; poseB = poses.strike; segmentT = 1 + (p - 0.58) / 0.16; attackBlend = 1; }
-          else { poseA = poses.windup; poseB = poses.strike; segmentT = 2; attackBlend = (1 - p) / 0.26; }
-        } else {
-          poseA = poses.windup; poseB = poses.strike;
-          if (p < 0.26) { segmentT = p / 0.26; attackBlend = segmentT; }
-          else if (p < 0.5) { segmentT = 1 + (p - 0.26) / 0.24; attackBlend = 1; }
-          else if (p < 0.68) { segmentT = 2; attackBlend = 1; }
-          else { segmentT = 2; attackBlend = (1 - p) / 0.32; }
-        }
-        attackBlend = THREE.MathUtils.clamp(attackBlend, 0, 1);
+      if (avatar.deadUntil && avatar.deadUntil <= now) {
+        // Death clip finished: stand back up for the respawn.
+        avatar.deadUntil = 0;
+        avatar.animator?.release();
       }
-
-      // Walk cycle fades out under the attack layer.
-      avatar.walk += delta * (avatar.moving ? 8 : 0);
-      const swingScale = 1 - attackBlend;
-      const swing = (avatar.moving ? Math.sin(avatar.walk) * 0.55 : 0) * swingScale;
-      const apply = (bone: THREE.Object3D | undefined, angle: number) => {
-        if (!bone) return;
-        const rest = avatar.rest.get(bone);
-        if (!rest) return;
-        swingQuaternion.setFromAxisAngle(swingAxis, angle);
-        bone.quaternion.copy(rest).multiply(swingQuaternion);
-      };
-      apply(avatar.limbs.leftUpperLeg, swing);
-      apply(avatar.limbs.rightUpperLeg, -swing);
-      apply(avatar.limbs.leftUpperArm, -swing * 0.6);
-      apply(avatar.limbs.rightUpperArm, swing * 0.6);
-      apply(avatar.limbs.leftLowerArm, 0);
-      apply(avatar.limbs.rightLowerArm, 0);
-      apply(avatar.limbs.leftLowerLeg, 0);
-      apply(avatar.limbs.rightLowerLeg, 0);
-
-      if (attackBlend > 0 && poseA && poseB) {
-        poseA.forEach((windup, bone) => {
-          const strike = poseB!.get(bone);
-          const rest = avatar.rest.get(bone);
-          if (!strike || !rest) return;
-          if (segmentT <= 1) targetQuaternion.copy(rest).slerp(windup, segmentT);
-          else targetQuaternion.copy(windup).slerp(strike, Math.min(segmentT, 2) - 1);
-          bone.quaternion.slerp(targetQuaternion, attackBlend);
-        });
+      if (!avatar.deadUntil) {
+        avatar.animator?.setLocomotion(avatar.moving ? CLIPS.walk : CLIPS.idle);
       }
+      avatar.animator?.update(delta);
     }
   };
 
@@ -456,5 +322,5 @@ export function createRemotePlayers(
     for (const id of [...avatars.keys()]) remove(id);
   };
 
-  return { setPlayers, setTemplate, update, hitTest, flash, dispose, count: () => avatars.size };
+  return { setPlayers, setTemplate, update, hitTest, flash, die, dispose, count: () => avatars.size };
 }
