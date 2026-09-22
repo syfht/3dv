@@ -411,10 +411,6 @@
   .block-icon.is-stone,
   .block-icon.is-chest,
   .block-icon.is-furnace,
-  .block-icon.is-wooden_staircase,
-  .block-icon.is-slab,
-  .block-icon.is-coal_ore,
-  .block-icon.is-torch,
   .block-icon.is-stick,
   .block-icon.is-wooden_sword,
   .block-icon.is-stone_sword,
@@ -425,10 +421,15 @@
   .block-icon.is-wooden_shovel,
   .block-icon.is-stone_shovel,
   .block-icon.is-wooden_hoe,
-  .block-icon.is-stone_hoe {
-    background-image: url("/__l5e/assets-v1/79fd9743-0b1d-446e-b110-0b61df9f39df/items.png");
+  .block-icon.is-stone_hoe,
+  .block-icon.is-wooden_staircase,
+  .block-icon.is-wooden_staircase_n,
+  .block-icon.is-wooden_staircase_s,
+  .block-icon.is-wooden_staircase_e,
+  .block-icon.is-wooden_staircase_w {
+    background-image: url("/__l5e/assets-v1/0489f1a7-ce2a-4dae-949e-f1204a1367b5/items.png");
     background-repeat: no-repeat;
-    background-size: 1800% 100%;
+    background-size: 1500% 100%;
     background-color: transparent;
     box-shadow: none;
     border-radius: 0;
@@ -440,64 +441,50 @@
     background-position: 0% 50%;
   }
   .block-icon.is-wooden_sword {
-    background-position: 5.8824% 50%;
+    background-position: 7.1429% 50%;
   }
   .block-icon.is-wooden_pickaxe {
-    background-position: 11.7647% 50%;
+    background-position: 14.2857% 50%;
   }
   .block-icon.is-wooden_axe {
-    background-position: 17.6471% 50%;
+    background-position: 21.4286% 50%;
   }
   .block-icon.is-wooden_shovel {
-    background-position: 23.5294% 50%;
+    background-position: 28.5714% 50%;
   }
   .block-icon.is-wooden_hoe {
-    background-position: 29.4118% 50%;
+    background-position: 35.7143% 50%;
   }
   .block-icon.is-stone_sword {
-    background-position: 35.2941% 50%;
+    background-position: 42.8571% 50%;
   }
   .block-icon.is-stone_pickaxe {
-    background-position: 41.1765% 50%;
+    background-position: 50% 50%;
   }
   .block-icon.is-stone_axe {
-    background-position: 47.0588% 50%;
+    background-position: 57.1429% 50%;
   }
   .block-icon.is-stone_shovel {
-    background-position: 52.9412% 50%;
+    background-position: 64.2857% 50%;
   }
   .block-icon.is-stone_hoe {
-    background-position: 58.8235% 50%;
+    background-position: 71.4286% 50%;
   }
   .block-icon.is-chest {
-    background-position: 64.7059% 50%;
+    background-position: 78.5714% 50%;
   }
   .block-icon.is-furnace {
-    background-position: 70.5882% 50%;
+    background-position: 85.7143% 50%;
   }
   .block-icon.is-stone {
-    background-position: 76.4706% 50%;
+    background-position: 92.8571% 50%;
   }
-  .block-icon.is-wooden_staircase {
-    background-position: 82.3529% 50%;
-  }
-  .block-icon.is-slab {
-    background-position: 88.2353% 50%;
-  }
-  .block-icon.is-coal_ore {
-    background-position: 94.1176% 50%;
-  }
-  .block-icon.is-torch {
+  .block-icon.is-wooden_staircase,
+  .block-icon.is-wooden_staircase_n,
+  .block-icon.is-wooden_staircase_s,
+  .block-icon.is-wooden_staircase_e,
+  .block-icon.is-wooden_staircase_w {
     background-position: 100% 50%;
-  }
-
-  .block-icon.is-coal {
-    background:
-      linear-gradient(135deg, transparent 0 14%, oklch(0.27 0.01 255) 15% 82%, transparent 83%),
-      linear-gradient(45deg, oklch(0.38 0.015 255) 0 35%, oklch(0.19 0.008 255) 36% 100%);
-    border-radius: 38% 24% 42% 30%;
-    box-shadow: inset 2px 2px 0 color-mix(in oklab, var(--hud-foreground) 18%, transparent), 0 1px 1px color-mix(in oklab, var(--background) 55%, transparent);
-    transform: rotate(-8deg) scale(0.82);
   }
 
   /* Ladder: two wooden rails with rungs between them. */
@@ -620,51 +607,6 @@
   .craft-arrow {
     text-align: center;
     font-size: 1.4rem;
-  }
-
-  .furnace-row {
-    display: grid;
-    grid-template-columns: 3rem minmax(5rem, 8rem) 3rem;
-    align-items: center;
-    justify-content: center;
-    gap: 1rem;
-    padding: 0.3rem 0 1.2rem;
-    margin-bottom: 1rem;
-    border-bottom: 1px solid color-mix(in oklab, var(--hud-foreground) 18%, transparent);
-  }
-
-  .furnace-inputs {
-    display: grid;
-    gap: 0.35rem;
-  }
-
-  .furnace-flame {
-    position: relative;
-    justify-self: center;
-    width: 0.9rem;
-    height: 1.2rem;
-    overflow: hidden;
-    background: color-mix(in oklab, var(--hud-foreground) 12%, transparent);
-    clip-path: polygon(50% 0, 92% 42%, 78% 100%, 22% 100%, 8% 42%);
-  }
-
-  .furnace-flame span {
-    position: absolute;
-    inset: auto 0 0;
-    background: var(--signal);
-  }
-
-  .furnace-progress {
-    height: 0.8rem;
-    overflow: hidden;
-    border: 1px solid color-mix(in oklab, var(--hud-foreground) 24%, transparent);
-    background: color-mix(in oklab, var(--background) 48%, transparent);
-  }
-
-  .furnace-progress span {
-    display: block;
-    height: 100%;
-    background: var(--signal);
   }
 
   .player-preview {
