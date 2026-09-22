@@ -18,8 +18,9 @@ export const LINK_TIMEOUT_MS = 30_000;
 /** Worlds nobody has visited for this long are replaced by a fresh one. */
 export const WORLD_IDLE_MS = 30 * 60_000;
 
-/** Which GLB clip an attacking player is playing: Skill_06 / Combo_02 / Guard_Counter. */
-export type AttackKind = "skill" | "combo" | "guard";
+/** Which GLB clip a player action is playing. */
+export type AttackKind = "skill" | "combo1" | "combo2" | "combo3" | "combo31" | "guardCounter" | "guard" | "roll";
+export type LocomotionKind = "idle" | "walk" | "backWalk" | "run";
 
 export type Pose = {
   x: number;
@@ -27,6 +28,7 @@ export type Pose = {
   z: number;
   ry: number;
   moving: boolean;
+  locomotion?: LocomotionKind;
   attack?: AttackKind | null;
   ap?: number;
   item?: ItemType | null;
