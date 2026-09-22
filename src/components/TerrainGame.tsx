@@ -10,7 +10,7 @@ import { makeHandItem } from "./handItems";
 import { createRemotePlayers } from "./remotePlayers";
 import { startBackgroundTicker } from "@/lib/backgroundTicker";
 import { CLIENT_ID, connectWorld, type RemotePose, type WorldSession } from "@/lib/multiplayer";
-import { HIT_RANGE, HURT_FLASH_MS, type AttackKind } from "@/lib/protocol";
+import { HIT_RANGE, HURT_FLASH_MS, type AttackKind, type LocomotionKind } from "@/lib/protocol";
 import {
   CLIPS,
   createCharacterAnimator,
@@ -53,6 +53,25 @@ function findBone(root: THREE.Object3D, partial: string) {
     if (!found && child.name.startsWith(partial)) found = child;
   });
   return found;
+}
+
+function tuneCharacterMaterials(root: THREE.Object3D) {
+  root.traverse((node) => {
+    const mesh = node as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) {
+      if (!(material instanceof THREE.MeshStandardMaterial)) continue;
+      // Preserve the authored albedo. Brightness should come from the world's
+      // lights rather than tinting the model between day and night.
+      material.color.setRGB(1, 1, 1);
+      material.roughness = Math.max(material.roughness, 0.72);
+      material.metalness = 0;
+      material.envMapIntensity = Math.min(material.envMapIntensity, 0.35);
+      material.emissive.setRGB(0, 0, 0);
+      material.needsUpdate = true;
+    }
+  });
 }
 
 
@@ -481,7 +500,7 @@ export default function TerrainGame({
     renderer.setPixelRatio(lowFx ? 1 : Math.min(window.devicePixelRatio, 1.75));
     renderer.setSize(host.clientWidth, host.clientHeight);
     renderer.shadowMap.enabled = !lowFx;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
 
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -505,6 +524,8 @@ export default function TerrainGame({
     const moon = new THREE.DirectionalLight(0xbcd2ff, 0);
     scene.add(moon);
     scene.add(moon.target);
+    const characterFill = new THREE.PointLight(0xffd0aa, 0, 4.8, 1.9);
+    scene.add(characterFill);
 
     const skyGroup = new THREE.Group();
     scene.add(skyGroup);
@@ -716,6 +737,18 @@ export default function TerrainGame({
     let walkTime = 0;
     let verticalVelocity = 0;
     let grounded = true;
+    // Double jump: one extra mid-air jump before touching the ground again.
+    let jumpsUsed = 0;
+    const MAX_JUMPS = 2;
+    const tryJump = () => {
+      if (jumpsUsed >= MAX_JUMPS) return;
+      verticalVelocity = jumpsUsed === 0 ? 5.4 : 5.0;
+      jumpsUsed += 1;
+      grounded = false;
+      // Low priority: never interrupts an attack or damage reaction.
+      animator?.play(CLIPS.jump, { priority: 0 });
+    };
+
     let visualStepOffset = 0;
     let landingImpact = 0;
     let regenTimer = 0;
@@ -737,27 +770,55 @@ export default function TerrainGame({
     const STEP_CLIMB_SPEED = 4.2; // blocks per second when the ground rises under a standing player
     // Attacks map straight onto clips in the model.
     type AttackMode = AttackKind;
-    const ATTACK_CLIP: { skill: string; combo: string; guard: string } = {
+    const ATTACK_CLIP: Record<AttackMode, string> = {
       skill: CLIPS.skill,
-      combo: CLIPS.combo,
-      guard: CLIPS.guardCounter,
+      combo1: CLIPS.combo1,
+      combo2: CLIPS.combo2,
+      combo3: CLIPS.combo3,
+      combo31: CLIPS.combo31,
+      guardCounter: CLIPS.guardCounter,
+      guard: CLIPS.guard,
+      roll: CLIPS.roll,
     };
-    const ATTACK_LABEL: { skill: string; combo: string; guard: string } = {
+    const ATTACK_LABEL: Record<AttackMode, string> = {
       skill: "SKILL",
-      combo: "COMBO",
-      guard: "GUARD COUNTER",
+      combo1: "COMBO 01",
+      combo2: "COMBO 02",
+      combo3: "COMBO 03",
+      combo31: "COMBO 03-1",
+      guardCounter: "GUARD COUNTER",
+      guard: "GUARD",
+      roll: "ROLL",
+    };
+    const ATTACK_HITS: Record<AttackMode, number> = {
+      skill: 1,
+      combo1: 2,
+      combo2: 2,
+      combo3: 2,
+      combo31: 2,
+      guardCounter: 1,
+      guard: 0,
+      roll: 0,
     };
     // Replaced with the real clip lengths once the model has loaded.
-    const ATTACK_DURATIONS: { skill: number; combo: number; guard: number } = {
+    const ATTACK_DURATIONS: Record<AttackMode, number> = {
       skill: 0.9,
-      combo: 1.4,
-      guard: 1.1,
+      combo1: 1.25,
+      combo2: 1.4,
+      combo3: 1.35,
+      combo31: 1.35,
+      guardCounter: 1.1,
+      guard: 0.9,
+      roll: 0.8,
     };
     let animator: CharacterAnimator | null = null;
     let attackTime = 0;
     let attackMode: AttackMode | null = null;
     let lastLeftClickAt = 0;
+    let lastRightClickAt = 0;
     let pendingHits = 0;
+    let rollTime = 0;
+    const rollDirection = new THREE.Vector3();
     // Death: Dead_A plays out fully before the drop + respawn.
     let dying = false;
     let deathTimer = 0;
@@ -770,9 +831,15 @@ export default function TerrainGame({
     let attackBonus = 0;
 
     function startAttack(mode: AttackMode) {
+      if (dying) return;
       attackMode = mode;
       attackTime = ATTACK_DURATIONS[mode];
-      pendingHits = mode === "combo" ? 2 : 1;
+      pendingHits = ATTACK_HITS[mode];
+      if (mode === "roll") {
+        rollTime = Math.min(attackTime || 0.8, 0.48);
+        rollDirection.set(Math.sin(character.rotation.y), 0, Math.cos(character.rotation.y)).normalize();
+        miningHeld = false;
+      }
       poseTimer = 0; // tell everyone else about the swing right away
       setAttackLabel(ATTACK_LABEL[mode]);
       animator?.play(ATTACK_CLIP[mode], { priority: 1 });
@@ -786,6 +853,7 @@ export default function TerrainGame({
       miningHeld = false;
       setAttackLabel(null);
       deathTimer = deathDuration;
+      rollTime = 0;
       animator?.play(CLIPS.dead, { priority: 3, hold: true, fade: 0.18 });
     }
 
@@ -807,7 +875,7 @@ export default function TerrainGame({
       const item = invRef.current[selectedRef.current]?.type ?? null;
       if (item && item.endsWith("_sword")) return 4;
       if (item && item !== "stick" && !isPlaceable(item)) return 3;
-      return mode === "guard" ? 2 : 1;
+      return mode === "guardCounter" ? 2 : 1;
     };
 
     // Held item: one block mesh per type, parented to the right hand.
@@ -854,6 +922,7 @@ export default function TerrainGame({
           mesh.receiveShadow = true;
         }
       });
+      tuneCharacterMaterials(loadedModel);
 
       // Held block: shows the selected hotbar block in the right hand.
       const handBone = findBone(loadedModel, "R_Hand_Attach") ?? findBone(loadedModel, "R_Hand_");
@@ -870,8 +939,13 @@ export default function TerrainGame({
       animator = createCharacterAnimator(loadedModel, gltf.animations);
       animator.setLocomotion(CLIPS.idle, 0);
       ATTACK_DURATIONS.skill = animator.duration(CLIPS.skill) || ATTACK_DURATIONS.skill;
-      ATTACK_DURATIONS.combo = animator.duration(CLIPS.combo) || ATTACK_DURATIONS.combo;
-      ATTACK_DURATIONS.guard = animator.duration(CLIPS.guardCounter) || ATTACK_DURATIONS.guard;
+      ATTACK_DURATIONS.combo1 = animator.duration(CLIPS.combo1) || ATTACK_DURATIONS.combo1;
+      ATTACK_DURATIONS.combo2 = animator.duration(CLIPS.combo2) || ATTACK_DURATIONS.combo2;
+      ATTACK_DURATIONS.combo3 = animator.duration(CLIPS.combo3) || ATTACK_DURATIONS.combo3;
+      ATTACK_DURATIONS.combo31 = animator.duration(CLIPS.combo31) || ATTACK_DURATIONS.combo31;
+      ATTACK_DURATIONS.guardCounter = animator.duration(CLIPS.guardCounter) || ATTACK_DURATIONS.guardCounter;
+      ATTACK_DURATIONS.guard = animator.duration(CLIPS.guard) || ATTACK_DURATIONS.guard;
+      ATTACK_DURATIONS.roll = animator.duration(CLIPS.roll) || ATTACK_DURATIONS.roll;
       deathDuration = animator.duration(CLIPS.dead) || deathDuration;
       // Other players use the same character and the same clips.
       remotePlayers.setTemplate(loadedModel, gltf.animations);
@@ -1013,11 +1087,24 @@ export default function TerrainGame({
         firstPersonView = !firstPersonView;
         cameraPitch = THREE.MathUtils.clamp(cameraPitch, -1.2, 1.2);
       }
-      if (event.code === "Space" && grounded) {
-        verticalVelocity = 5.4;
-        grounded = false;
-        // Low priority: never interrupts an attack or damage reaction.
-        animator?.play(CLIPS.jump, { priority: 0 });
+      if (event.code === "Space" && !event.repeat) {
+        tryJump();
+      }
+
+      if (!event.repeat && !dying) {
+        if (event.code === "KeyC") {
+          event.preventDefault();
+          startAttack("roll");
+        } else if (event.code === "KeyV") {
+          event.preventDefault();
+          startAttack("combo3");
+        } else if (event.code === "KeyF") {
+          event.preventDefault();
+          startAttack("guard");
+        } else if (event.code === "KeyR") {
+          event.preventDefault();
+          startAttack("combo31");
+        }
       }
       // Number keys pick a hotbar slot.
       const digit = /^Digit([1-9])$/.exec(event.code);
@@ -1062,20 +1149,27 @@ export default function TerrainGame({
       if (event.button === 2 && placeSelected()) return;
       if (dying) return;
       // Left click = Skill_06, double left click = Combo_02,
-      // right click (nothing to place) = Guard_Counter.
+      // right click (nothing to place) = Guard_Counter, double right = Combo_01.
       // Pointer lock zeroes event.detail, so the double click is timed here;
       // the second click upgrades the running skill into the combo.
       if (event.button === 0) {
         const now = performance.now();
         const isDouble = now - lastLeftClickAt < 320;
         lastLeftClickAt = now;
-        if (isDouble && attackMode !== "combo") {
-          startAttack("combo");
+        if (isDouble && attackMode !== "combo2") {
+          startAttack("combo2");
         } else if (attackTime <= 0) {
           startAttack("skill");
         }
-      } else if (event.button === 2 && attackTime <= 0) {
-        startAttack("guard");
+      } else if (event.button === 2) {
+        const now = performance.now();
+        const isDouble = now - lastRightClickAt < 320;
+        lastRightClickAt = now;
+        if (isDouble && attackMode !== "combo1") {
+          startAttack("combo1");
+        } else if (attackTime <= 0) {
+          startAttack("guardCounter");
+        }
       }
     };
 
@@ -1134,12 +1228,9 @@ export default function TerrainGame({
       // Touch buttons queue a jump / place for the next frame.
       if (touchJumpRef.current) {
         touchJumpRef.current = false;
-        if (grounded && !anyMenuOpen()) {
-          verticalVelocity = 5.4;
-          grounded = false;
-          animator?.play(CLIPS.jump, { priority: 0 });
-        }
+        if (!anyMenuOpen()) tryJump();
       }
+
       if (touchPlaceRef.current) {
         touchPlaceRef.current = false;
         if (!anyMenuOpen()) placeSelected();
@@ -1155,22 +1246,24 @@ export default function TerrainGame({
         stick.x;
       const inputLength = Math.hypot(forward, strafe);
       const sprinting = Boolean(keys["ShiftLeft"] || keys["ShiftRight"]);
+      const backPedaling = forward < -0.12 && Math.abs(strafe) < 0.22;
       // A dead body does not walk: Dead_A holds until the respawn.
       const speed =
         !dying && inputLength > 0.12 ? (sprinting ? 5.2 : 2.7) * Math.min(1, inputLength) : 0;
+      const locomotionMode: LocomotionKind =
+        speed > 0 ? (backPedaling ? "backWalk" : sprinting ? "run" : "walk") : "idle";
       const direction = new THREE.Vector3(strafe, 0, -forward);
+      const canStandAt = (x: number, z: number) =>
+        world.groundHeight(x, z, character.position.y + STEP_TOLERANCE) <= character.position.y + STEP_TOLERANCE;
       if (speed > 0) {
         direction.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraYaw);
         // No auto-jump: any column above the feet blocks movement until the player jumps.
         const step = speed * delta;
-        const feetY = character.position.y;
-        const canStand = (x: number, z: number) =>
-          world.groundHeight(x, z, feetY + STEP_TOLERANCE) <= feetY + STEP_TOLERANCE;
         const nextX = character.position.x + direction.x * step;
         const nextZ = character.position.z + direction.z * step;
-        if (canStand(nextX, character.position.z)) character.position.x = nextX;
-        if (canStand(character.position.x, nextZ)) character.position.z = nextZ;
-        const targetAngle = Math.atan2(direction.x, direction.z);
+        if (canStandAt(nextX, character.position.z)) character.position.x = nextX;
+        if (canStandAt(character.position.x, nextZ)) character.position.z = nextZ;
+        const targetAngle = backPedaling ? cameraYaw + Math.PI : Math.atan2(direction.x, direction.z);
         let turn = targetAngle - character.rotation.y;
         turn = Math.atan2(Math.sin(turn), Math.cos(turn));
         const appliedTurn = turn * Math.min(1, delta * 9);
@@ -1183,6 +1276,15 @@ export default function TerrainGame({
       }
       // The model's forward axis is +Z, so it must face opposite the camera yaw.
       if (firstPersonView) character.rotation.y = cameraYaw + Math.PI;
+      if (rollTime > 0 && !dying) {
+        const rollStep = Math.min(rollTime, delta) * 6.4;
+        rollTime = Math.max(0, rollTime - delta);
+        const nextX = character.position.x + rollDirection.x * rollStep;
+        const nextZ = character.position.z + rollDirection.z * rollStep;
+        if (canStandAt(nextX, character.position.z)) character.position.x = nextX;
+        if (canStandAt(character.position.x, nextZ)) character.position.z = nextZ;
+        worldVelocity.copy(rollDirection).multiplyScalar(6.4);
+      }
 
       // Ladders: no gravity while touching one. Walk forward (or jump) to go
       // up, crouch to go down, otherwise you simply hang on. The -0.6 check
@@ -1197,7 +1299,7 @@ export default function TerrainGame({
         !world.isClimbable(character.position.x, character.position.y + 0.2, character.position.z);
       if (onLadder) {
         verticalVelocity = 0;
-        const crouching = Boolean(keys["ControlLeft"] || keys["KeyC"]);
+        const crouching = Boolean(keys["ControlLeft"] || keys["ControlRight"]);
         // Stop climbing once you are a block clear of the top rung.
         if ((speed > 0 || keys["Space"]) && !aboveLadderTop) character.position.y += 3 * delta;
         else if (crouching) character.position.y -= 3 * delta;
@@ -1213,6 +1315,7 @@ export default function TerrainGame({
       if (onLadder) {
         if (character.position.y < groundY) character.position.y = groundY;
         grounded = true;
+        jumpsUsed = 0;
       } else if (character.position.y <= groundY) {
         const heightCorrection = groundY - character.position.y;
         if (grounded && heightCorrection > 0.02) {
@@ -1232,9 +1335,13 @@ export default function TerrainGame({
         }
         verticalVelocity = 0;
         grounded = true;
+        jumpsUsed = 0;
       } else {
+        // Walking off a ledge spends the ground jump, leaving one air jump.
+        if (jumpsUsed === 0) jumpsUsed = 1;
         grounded = false;
       }
+
       world.update(delta, character.position, addToInventory);
       // Furnaces continue smelting whether their screen is open or closed.
       for (const [key, furnace] of furnaceStoreRef.current) {
@@ -1310,11 +1417,11 @@ export default function TerrainGame({
         const p = total > 0 ? 1 - attackTime / total : 1;
         // The moment in the clip where the blow lands.
         const hitPoint =
-          attackMode === "combo"
+          attackMode === "combo1" || attackMode === "combo2" || attackMode === "combo3" || attackMode === "combo31"
             ? pendingHits === 2
               ? 0.32
               : 0.7
-            : attackMode === "guard"
+            : attackMode === "guardCounter"
               ? 0.45
               : 0.5;
         if (pendingHits > 0 && p >= hitPoint) {
@@ -1339,7 +1446,15 @@ export default function TerrainGame({
       }
 
       if (!dying) {
-        animator?.setLocomotion(speed > 0 ? (sprinting ? CLIPS.run : CLIPS.walk) : CLIPS.idle);
+        animator?.setLocomotion(
+          locomotionMode === "run"
+            ? CLIPS.run
+            : locomotionMode === "backWalk"
+              ? CLIPS.backWalk
+              : locomotionMode === "walk"
+                ? CLIPS.walk
+                : CLIPS.idle,
+        );
       }
       animator?.update(delta);
 
@@ -1575,8 +1690,11 @@ export default function TerrainGame({
       sun.visible = dayFactor > 0.01;
       moon.position.copy(character.position).addScaledVector(sunDir, -40);
       moon.target.position.copy(character.position);
-      moon.intensity = 0.9 * nightFactor;
-      hemi.intensity = 0.35 + 1.9 * dayFactor;
+      moon.intensity = 0.52 * nightFactor;
+      hemi.intensity = 0.22 + 1.9 * dayFactor;
+      characterFill.position.copy(character.position).add(new THREE.Vector3(0, 1.25, 1.1));
+      characterFill.intensity = 0.45 * nightFactor;
+      renderer.toneMappingExposure = 0.88 + 0.17 * dayFactor;
 
       const horizonGlow = THREE.MathUtils.clamp(1 - Math.abs(elevation) / 0.25, 0, 1);
       skyColor.copy(skyNight).lerp(skyDay, dayFactor).lerp(skyDusk, horizonGlow * 0.45);
@@ -1598,6 +1716,7 @@ export default function TerrainGame({
           z: character.position.z,
           ry: character.rotation.y,
           moving: speed > 0,
+          locomotion: locomotionMode,
           attack: attackMode,
           ap: attackMode ? 1 - attackTime / ATTACK_DURATIONS[attackMode] : 0,
           item: invRef.current[selectedRef.current]?.type ?? null,
