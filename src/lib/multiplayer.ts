@@ -138,6 +138,8 @@ export type WorldHandlers = {
   onHit?: (amount: number, from: string) => void;
   /** A player (possibly us) took damage: flash them red. */
   onHurt?: (id: string) => void;
+  /** Another player ran out of health: play their death animation. */
+  onDeath?: (id: string) => void;
   /** We respawned after running out of health. */
   onTeleport?: (position: { x: number; y: number; z: number }, reason: "respawn" | "correct") => void;
   /** Another player spilled items into the world. */
@@ -153,6 +155,7 @@ export type WorldHandlers = {
 type PoseBroadcast = PlayerState;
 type HitBroadcast = { target: string; amount: number; from: string };
 type HurtBroadcast = { id: string };
+type DeathBroadcast = { id: string };
 type DropsBroadcast = {
   x: number;
   y: number;
@@ -207,7 +210,11 @@ export function connectWorld(
     if (from) handlers.onHit?.(amount, from);
     handlers.onHurt?.(CLIENT_ID);
     push("hurt", { id: CLIENT_ID } satisfies HurtBroadcast);
-    if (hp <= 0) respawn();
+    if (hp <= 0) {
+      // Tell everyone else so they see the death animation too.
+      push("death", { id: CLIENT_ID } satisfies DeathBroadcast);
+      respawn();
+    }
   };
 
   const respawn = () => {
@@ -237,6 +244,10 @@ export function connectWorld(
     .on("broadcast", { event: "hurt" }, ({ payload }) => {
       const hurt = payload as HurtBroadcast;
       if (hurt?.id && hurt.id !== CLIENT_ID) handlers.onHurt?.(hurt.id);
+    })
+    .on("broadcast", { event: "death" }, ({ payload }) => {
+      const death = payload as DeathBroadcast;
+      if (death?.id && death.id !== CLIENT_ID) handlers.onDeath?.(death.id);
     })
     .on("broadcast", { event: "drops" }, ({ payload }) => {
       const drop = payload as DropsBroadcast;
