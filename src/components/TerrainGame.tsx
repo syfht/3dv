@@ -10,7 +10,13 @@ import { makeHandItem } from "./handItems";
 import { createRemotePlayers } from "./remotePlayers";
 import { startBackgroundTicker } from "@/lib/backgroundTicker";
 import { CLIENT_ID, connectWorld, type RemotePose, type WorldSession } from "@/lib/multiplayer";
-import { HIT_RANGE, HURT_FLASH_MS } from "@/lib/protocol";
+import { HIT_RANGE, HURT_FLASH_MS, type AttackKind } from "@/lib/protocol";
+import {
+  CLIPS,
+  createCharacterAnimator,
+  randomDamageClip,
+  type CharacterAnimator,
+} from "./characterAnimator";
 import {
   BLOCK_LABEL,
   BREAK_TIMES,
@@ -40,22 +46,6 @@ type SpringBone = {
   weight: number;
 };
 
-const BONE_NAMES = {
-  hips: "C_Hips_",
-  spine: "C_Spine1_",
-  chest: "C_Chest_",
-  head: "C_Head_",
-  leftUpperArm: "L_Arm1_",
-  rightUpperArm: "R_Arm1_",
-  leftLowerArm: "L_Arm2_",
-  rightLowerArm: "R_Arm2_",
-  leftUpperLeg: "L_Leg1_",
-  rightUpperLeg: "R_Leg1_",
-  leftLowerLeg: "L_Leg2_",
-  rightLowerLeg: "R_Leg2_",
-  leftFoot: "L_Foot_",
-  rightFoot: "R_Foot_",
-} as const;
 
 function findBone(root: THREE.Object3D, partial: string) {
   let found: THREE.Object3D | undefined;
@@ -106,8 +96,11 @@ export default function TerrainGame({
   // Taking damage flashes the screen red, the way Minecraft tints a hit player.
   const [hurt, setHurt] = useState(false);
   const hurtTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set once the character model is ready: plays Damage_A / Damage_C.
+  const playDamageRef = useRef<() => void>(() => {});
   const flashHurt = () => {
     setHurt(true);
+    playDamageRef.current();
     if (hurtTimer.current) clearTimeout(hurtTimer.current);
     hurtTimer.current = setTimeout(() => setHurt(false), HURT_FLASH_MS);
   };
@@ -581,9 +574,14 @@ export default function TerrainGame({
             remotePlayers.setPlayers(players);
             setPlayerCount(players.length + 1);
           },
-          onHealth: (hp) => setHealthValue(hp),
+          onHealth: (hp) => {
+            setHealthValue(hp);
+            // Killed: play Dead_A before the drop and respawn.
+            if (hp <= 0) beginDeath();
+          },
           onHit: () => flashHurt(),
           onHurt: (id) => remotePlayers.flash(id),
+          onDeath: (id) => remotePlayers.die(id),
           onDrops: (position, items) => {
             const at = new THREE.Vector3(position.x, position.y, position.z);
             for (const item of items) {
@@ -595,7 +593,13 @@ export default function TerrainGame({
           },
           onPickup: (id) => world.removeDrop(id),
           onTeleport: (position, reason) => {
-            if (reason === "respawn") dropInventory?.();
+            if (reason === "respawn") {
+              // Wait for the death animation: the frame loop drops the items
+              // and moves the body once Dead_A has finished.
+              beginDeath();
+              pendingRespawn = { x: position.x, y: position.y, z: position.z };
+              return;
+            }
             teleportTo?.(position.x, position.y, position.z);
           },
         },
@@ -719,7 +723,6 @@ export default function TerrainGame({
       character.position.set(x, y, z);
       verticalVelocity = 0;
     };
-    let airborneBlend = 0;
     let cameraYaw = 0;
     let cameraPitch = 0.12;
     let cameraDistance = 4.2;
@@ -732,42 +735,88 @@ export default function TerrainGame({
     // A full voxel can be stepped onto; the model eases up visually below.
     const STEP_TOLERANCE = 0.52; // slabs and each half of a staircase are walkable
     const STEP_CLIMB_SPEED = 4.2; // blocks per second when the ground rises under a standing player
-    type AttackMode = "punch" | "combo" | "kick";
-    type PoseMap = Map<THREE.Object3D, THREE.Quaternion>;
-    const ATTACK_DURATIONS: Record<AttackMode, number> = { punch: 0.72, combo: 1.3, kick: 0.9 };
+    // Attacks map straight onto clips in the model.
+    type AttackMode = AttackKind;
+    const ATTACK_CLIP: { skill: string; combo: string; guard: string } = {
+      skill: CLIPS.skill,
+      combo: CLIPS.combo,
+      guard: CLIPS.guardCounter,
+    };
+    const ATTACK_LABEL: { skill: string; combo: string; guard: string } = {
+      skill: "SKILL",
+      combo: "COMBO",
+      guard: "GUARD COUNTER",
+    };
+    // Replaced with the real clip lengths once the model has loaded.
+    const ATTACK_DURATIONS: { skill: number; combo: number; guard: number } = {
+      skill: 0.9,
+      combo: 1.4,
+      guard: 1.1,
+    };
+    let animator: CharacterAnimator | null = null;
     let attackTime = 0;
     let attackMode: AttackMode | null = null;
-    // True when a punch is chained from a previous punch (held mining): the
-    // swing then returns strike -> windup -> strike instead of snapping from
-    // the extended strike back to the windup.
-    let chainedPunch = false;
+    let lastLeftClickAt = 0;
     let pendingHits = 0;
+    // Death: Dead_A plays out fully before the drop + respawn.
+    let dying = false;
+    let deathTimer = 0;
+    let deathDuration = 1.6;
+    let pendingRespawn: { x: number; y: number; z: number } | null = null;
     // Progressive (Minecraft-style) block breaking.
     let miningHeld = false;
     let miningProgress = 0;
     let miningBlock: [number, number, number] | null = null;
     let attackBonus = 0;
 
-    // Damage dealt to another player, in half-hearts (2 units = 1 heart):
-    // punch/combo 0.5, kick 1, tool 1.5, sword 2 hearts.
+    function startAttack(mode: AttackMode) {
+      attackMode = mode;
+      attackTime = ATTACK_DURATIONS[mode];
+      pendingHits = mode === "combo" ? 2 : 1;
+      poseTimer = 0; // tell everyone else about the swing right away
+      setAttackLabel(ATTACK_LABEL[mode]);
+      animator?.play(ATTACK_CLIP[mode], { priority: 1 });
+    }
+
+    function beginDeath() {
+      if (dying) return;
+      dying = true;
+      attackMode = null;
+      attackTime = 0;
+      miningHeld = false;
+      setAttackLabel(null);
+      deathTimer = deathDuration;
+      animator?.play(CLIPS.dead, { priority: 3, hold: true, fade: 0.18 });
+    }
+
+    function endDeath() {
+      dying = false;
+      deathTimer = 0;
+      animator?.release(0.3);
+    }
+
+    // Damage reactions use one of the model's two hit clips at random.
+    playDamageRef.current = () => {
+      if (dying) return;
+      animator?.play(randomDamageClip(), { priority: 2, fade: 0.1 });
+    };
+
+    // Damage dealt to another player, in half-hearts (2 units = 1 heart).
     const pvpAim = new THREE.Vector3();
     const meleeDamage = (mode: AttackMode | null) => {
       const item = invRef.current[selectedRef.current]?.type ?? null;
       if (item && item.endsWith("_sword")) return 4;
       if (item && item !== "stick" && !isPlaceable(item)) return 3;
-      return mode === "kick" ? 2 : 1;
+      return mode === "guard" ? 2 : 1;
     };
 
-    let windupPose: PoseMap | undefined;
-    let strikePose: PoseMap | undefined;
-    let jabWindupPose: PoseMap | undefined;
-    let jabStrikePose: PoseMap | undefined;
-    let kickWindupPose: PoseMap | undefined;
-    let kickStrikePose: PoseMap | undefined;
-    let airbornePose: PoseMap | undefined;
     // Held item: one block mesh per type, parented to the right hand.
     let handAttach: THREE.Object3D | null = null;
     let handScale = 1;
+    // First person puts the camera on the head bone; the head itself is shrunk
+    // away so the face and hair never block the view.
+    let headBone: THREE.Object3D | null = null;
+    let headRestScale = 1;
     const heldMeshes = new Map<ItemType, THREE.Object3D>();
     let heldType: ItemType | null = null;
 
@@ -780,8 +829,6 @@ export default function TerrainGame({
     const worldAcceleration = new THREE.Vector3();
     const localAcceleration = new THREE.Vector3();
     let lastMovingState = false;
-    const restRotations = new Map<THREE.Object3D, THREE.Quaternion>();
-    const bones: Partial<Record<keyof typeof BONE_NAMES, THREE.Object3D>> = {};
     const springBones: SpringBone[] = [];
     const clock = new THREE.Clock();
 
@@ -806,13 +853,7 @@ export default function TerrainGame({
           mesh.castShadow = true;
           mesh.receiveShadow = true;
         }
-        if ((node as THREE.Bone).isBone) restRotations.set(node, node.quaternion.clone());
       });
-
-      for (const [key, value] of Object.entries(BONE_NAMES)) {
-        const bone = findBone(loadedModel, value);
-        if (bone) bones[key as keyof typeof BONE_NAMES] = bone;
-      }
 
       // Held block: shows the selected hotbar block in the right hand.
       const handBone = findBone(loadedModel, "R_Hand_Attach") ?? findBone(loadedModel, "R_Hand_");
@@ -822,112 +863,20 @@ export default function TerrainGame({
         handScale = handBone.getWorldScale(new THREE.Vector3()).x || 1;
       }
 
-      // The GLB ships in a T-pose with no animation clips, so bake a relaxed
-      // standing pose into the rest rotations by aiming each limb bone at a
-      // desired world-space direction (model forward is +Z).
-      const aimBone = (
-        bone: THREE.Object3D | undefined,
-        makeTarget: (currentDirection: THREE.Vector3, side: number) => THREE.Vector3,
-        store: Map<THREE.Object3D, THREE.Quaternion> = restRotations,
-      ) => {
-        if (!bone || !bone.parent) return;
-        const childBone = bone.children.find((child) => (child as THREE.Bone).isBone);
-        if (!childBone) return;
-        loadedModel.updateMatrixWorld(true);
-        const origin = bone.getWorldPosition(new THREE.Vector3());
-        const direction = childBone.getWorldPosition(new THREE.Vector3()).sub(origin).normalize();
-        const side = direction.x >= 0 ? 1 : -1;
-        const target = makeTarget(direction, side).normalize();
-        const worldDelta = new THREE.Quaternion().setFromUnitVectors(direction, target);
-        const parentWorld = bone.parent.getWorldQuaternion(new THREE.Quaternion());
-        const currentLocal = bone.quaternion.clone();
-        bone.quaternion
-          .copy(parentWorld)
-          .invert()
-          .multiply(worldDelta)
-          .multiply(parentWorld)
-          .multiply(currentLocal);
+      headBone = findBone(loadedModel, "C_Head_") ?? null;
+      if (headBone) headRestScale = headBone.scale.x || 1;
 
-        bone.updateMatrixWorld(true);
-        store.set(bone, bone.quaternion.clone());
-      };
+      // All movement comes from the clips authored inside the GLB.
+      animator = createCharacterAnimator(loadedModel, gltf.animations);
+      animator.setLocomotion(CLIPS.idle, 0);
+      ATTACK_DURATIONS.skill = animator.duration(CLIPS.skill) || ATTACK_DURATIONS.skill;
+      ATTACK_DURATIONS.combo = animator.duration(CLIPS.combo) || ATTACK_DURATIONS.combo;
+      ATTACK_DURATIONS.guard = animator.duration(CLIPS.guardCounter) || ATTACK_DURATIONS.guard;
+      deathDuration = animator.duration(CLIPS.dead) || deathDuration;
+      // Other players use the same character and the same clips.
+      remotePlayers.setTemplate(loadedModel, gltf.animations);
 
-      // Capture a keyframe pose (without disturbing the standing rest pose).
-      const capturePose = (
-        aims: Array<[THREE.Object3D | undefined, (dir: THREE.Vector3, side: number) => THREE.Vector3]>,
-      ) => {
-        const pose = new Map<THREE.Object3D, THREE.Quaternion>();
-        const saved = new Map<THREE.Object3D, THREE.Quaternion>();
-        aims.forEach(([bone]) => { if (bone) saved.set(bone, bone.quaternion.clone()); });
-        aims.forEach(([bone, target]) => aimBone(bone, target, pose));
-        saved.forEach((quaternion, bone) => bone.quaternion.copy(quaternion));
-        loadedModel.updateMatrixWorld(true);
-        return pose;
-      };
 
-      // Arms hang down from the shoulders instead of stretching sideways.
-      aimBone(bones.leftUpperArm, (_dir, side) => new THREE.Vector3(side * 0.3, -0.95, 0.04));
-      aimBone(bones.rightUpperArm, (_dir, side) => new THREE.Vector3(side * 0.5, -0.82, -0.2));
-      // Left forearm relaxed, right forearm folded in so the hand rests on the hip.
-      aimBone(bones.leftLowerArm, (_dir, side) => new THREE.Vector3(side * 0.12, -0.98, 0.1));
-      aimBone(bones.rightLowerArm, (_dir, side) => new THREE.Vector3(-side * 0.42, -0.84, 0.32));
-
-      // Legs brought together, knees and feet straightened under the hips.
-      aimBone(bones.leftUpperLeg, (_dir, side) => new THREE.Vector3(-side * 0.055, -1, 0));
-      aimBone(bones.rightUpperLeg, (_dir, side) => new THREE.Vector3(-side * 0.055, -1, 0));
-      aimBone(bones.leftLowerLeg, (_dir, side) => new THREE.Vector3(side * 0.03, -1, 0.02));
-      aimBone(bones.rightLowerLeg, (_dir, side) => new THREE.Vector3(side * 0.03, -1, 0.02));
-      loadedModel.updateMatrixWorld(true);
-      // Other players use the same character, in this same relaxed pose.
-      remotePlayers.setTemplate(loadedModel);
-
-      // Attack keyframes: wind up with the right fist drawn back, then a
-      // straight punch fully extended forward (model forward is +Z).
-      windupPose = capturePose([
-        [bones.rightUpperArm, (_d, side) => new THREE.Vector3(side * 0.55, -0.4, -0.6)],
-        [bones.rightLowerArm, (_d, side) => new THREE.Vector3(-side * 0.7, 0.15, 0.2)],
-        [bones.leftUpperArm, (_d, side) => new THREE.Vector3(side * 0.7, -0.35, 0.4)],
-        [bones.leftLowerArm, (_d, side) => new THREE.Vector3(-side * 0.15, 0.05, 0.95)],
-      ]);
-      strikePose = capturePose([
-        [bones.rightUpperArm, (_d, side) => new THREE.Vector3(side * 0.26, -0.14, 0.95)],
-        [bones.rightLowerArm, (_d, side) => new THREE.Vector3(side * 0.06, -0.06, 1)],
-        [bones.leftUpperArm, (_d, side) => new THREE.Vector3(side * 0.62, -0.45, -0.4)],
-        [bones.leftLowerArm, (_d, side) => new THREE.Vector3(-side * 0.4, -0.1, -0.3)],
-      ]);
-
-      // Combo first hit: a left jab (right hand stays guarding the face).
-      jabWindupPose = capturePose([
-        [bones.leftUpperArm, (_d, side) => new THREE.Vector3(side * 0.42, -0.5, -0.62)],
-        [bones.leftLowerArm, (_d, side) => new THREE.Vector3(-side * 0.6, 0.12, 0.32)],
-        [bones.rightUpperArm, (_d, side) => new THREE.Vector3(side * 0.45, -0.62, 0.3)],
-        [bones.rightLowerArm, (_d, side) => new THREE.Vector3(-side * 0.5, 0.2, 0.55)],
-      ]);
-      jabStrikePose = capturePose([
-        [bones.leftUpperArm, (_d, side) => new THREE.Vector3(side * 0.14, -0.1, 0.98)],
-        [bones.leftLowerArm, (_d, side) => new THREE.Vector3(side * 0.04, -0.04, 1)],
-        [bones.rightUpperArm, (_d, side) => new THREE.Vector3(side * 0.45, -0.62, 0.3)],
-        [bones.rightLowerArm, (_d, side) => new THREE.Vector3(-side * 0.5, 0.2, 0.55)],
-      ]);
-
-      // Kick: chamber the right knee, then snap the leg straight forward.
-      kickWindupPose = capturePose([
-        [bones.rightUpperLeg, () => new THREE.Vector3(0, -0.2, 0.98)],
-        [bones.rightLowerLeg, () => new THREE.Vector3(0, -0.85, -0.5)],
-      ]);
-      kickStrikePose = capturePose([
-        [bones.rightUpperLeg, () => new THREE.Vector3(0, 0.12, 0.99)],
-        [bones.rightLowerLeg, () => new THREE.Vector3(0, 0.05, 1)],
-      ]);
-
-      // Airborne balance pose for the arms only; the legs are driven
-      // procedurally each frame so the whole limb swings, not just the feet.
-      airbornePose = capturePose([
-        [bones.leftUpperArm, (_d, side) => new THREE.Vector3(side * 0.62, 0.62, -0.2)],
-        [bones.rightUpperArm, (_d, side) => new THREE.Vector3(side * 0.7, 0.3, 0.2)],
-        [bones.leftLowerArm, (_d, side) => new THREE.Vector3(side * 0.3, 0.92, 0.1)],
-        [bones.rightLowerArm, (_d, side) => new THREE.Vector3(side * 0.35, 0.6, 0.4)],
-      ]);
 
 
       loadedModel.traverse((node) => {
@@ -1067,6 +1016,8 @@ export default function TerrainGame({
       if (event.code === "Space" && grounded) {
         verticalVelocity = 5.4;
         grounded = false;
+        // Low priority: never interrupts an attack or damage reaction.
+        animator?.play(CLIPS.jump, { priority: 0 });
       }
       // Number keys pick a hotbar slot.
       const digit = /^Digit([1-9])$/.exec(event.code);
@@ -1109,19 +1060,23 @@ export default function TerrainGame({
       if (event.button === 0) miningHeld = true;
       // Right click places the selected block when the hotbar slot holds one.
       if (event.button === 2 && placeSelected()) return;
-      if (attackTime > 0) return;
+      if (dying) return;
+      // Left click = Skill_06, double left click = Combo_02,
+      // right click (nothing to place) = Guard_Counter.
+      // Pointer lock zeroes event.detail, so the double click is timed here;
+      // the second click upgrades the running skill into the combo.
       if (event.button === 0) {
-        attackMode = event.detail >= 2 ? "combo" : "punch";
-      } else if (event.button === 2) {
-        attackMode = "kick";
-      } else {
-        return;
+        const now = performance.now();
+        const isDouble = now - lastLeftClickAt < 320;
+        lastLeftClickAt = now;
+        if (isDouble && attackMode !== "combo") {
+          startAttack("combo");
+        } else if (attackTime <= 0) {
+          startAttack("skill");
+        }
+      } else if (event.button === 2 && attackTime <= 0) {
+        startAttack("guard");
       }
-      chainedPunch = false;
-      attackTime = ATTACK_DURATIONS[attackMode];
-      pendingHits = attackMode === "combo" ? 2 : 1;
-      poseTimer = 0; // tell everyone else about the swing right away
-      setAttackLabel(attackMode === "punch" ? "PUNCH" : attackMode === "combo" ? "COMBO" : "KICK");
     };
 
     const onContextMenu = (event: Event) => event.preventDefault();
@@ -1169,12 +1124,6 @@ export default function TerrainGame({
     renderer.domElement.addEventListener("contextmenu", onContextMenu);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
 
-    const setBoneRotation = (bone: THREE.Object3D | undefined, x: number, y: number, z: number) => {
-      if (!bone) return;
-      const rest = restRotations.get(bone);
-      if (!rest) return;
-      bone.quaternion.copy(rest).multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(x, y, z)));
-    };
 
     let animationFrame = 0;
     // The world keeps simulating while the tab is in the background (browsers
@@ -1188,6 +1137,7 @@ export default function TerrainGame({
         if (grounded && !anyMenuOpen()) {
           verticalVelocity = 5.4;
           grounded = false;
+          animator?.play(CLIPS.jump, { priority: 0 });
         }
       }
       if (touchPlaceRef.current) {
@@ -1205,7 +1155,9 @@ export default function TerrainGame({
         stick.x;
       const inputLength = Math.hypot(forward, strafe);
       const sprinting = Boolean(keys["ShiftLeft"] || keys["ShiftRight"]);
-      const speed = inputLength > 0.12 ? (sprinting ? 5.2 : 2.7) * Math.min(1, inputLength) : 0;
+      // A dead body does not walk: Dead_A holds until the respawn.
+      const speed =
+        !dying && inputLength > 0.12 ? (sprinting ? 5.2 : 2.7) * Math.min(1, inputLength) : 0;
       const direction = new THREE.Vector3(strafe, 0, -forward);
       if (speed > 0) {
         direction.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraYaw);
@@ -1317,13 +1269,26 @@ export default function TerrainGame({
 
       // Health: slow regeneration, and a respawn when it runs out. Online the
       // server handles both (so it also works while this tab is asleep).
-      if (link) {
+      if (dying) {
+        // Dead_A plays out before the items drop and the player respawns.
+        deathTimer = Math.max(0, deathTimer - delta);
+        if (deathTimer === 0) {
+          dropInventory?.();
+          if (pendingRespawn) {
+            teleportTo?.(pendingRespawn.x, pendingRespawn.y, pendingRespawn.z);
+            pendingRespawn = null;
+          } else {
+            character.position.set(0.5, world.groundHeight(0.5, 0.5), 0.5);
+            verticalVelocity = 0;
+            if (!link) setHealthValue(MAX_HEALTH);
+          }
+          endDeath();
+        }
+        regenTimer = 0;
+      } else if (link) {
         /* server-authoritative */
       } else if (healthRef.current <= 0) {
-        dropInventory?.();
-        character.position.set(0.5, world.groundHeight(0.5, 0.5), 0.5);
-        verticalVelocity = 0;
-        setHealthValue(MAX_HEALTH);
+        beginDeath();
         regenTimer = 0;
       } else if (healthRef.current < MAX_HEALTH) {
         regenTimer += delta;
@@ -1336,73 +1301,22 @@ export default function TerrainGame({
       }
 
 
-      locomotionBlend = THREE.MathUtils.lerp(locomotionBlend, speed > 0 ? 1 : 0, 1 - Math.exp(-delta * (speed > 0 ? 9 : 7)));
-      if (speed > 0) walkTime += delta * (sprinting ? 10.5 : 7.2);
-      const locomotion = THREE.MathUtils.clamp(speed / 3.2, 0, 1.35) * locomotionBlend;
-      const gait = Math.sin(walkTime);
-      const stride = gait * 0.5 * locomotion;
-      const counter = -stride;
-      const kneeL = Math.max(0, -gait) * 0.68 * locomotion;
-      const kneeR = Math.max(0, gait) * 0.68 * locomotion;
-      const settle = speed === 0 ? Math.sin(clock.elapsedTime * 1.7) * 0.018 : 0;
-      const idleSway = (1 - locomotionBlend) * Math.sin(clock.elapsedTime * 0.82);
-
-      setBoneRotation(bones.leftUpperLeg, stride, 0, 0);
-      setBoneRotation(bones.rightUpperLeg, counter, 0, 0);
-      setBoneRotation(bones.leftLowerLeg, kneeL, 0, 0);
-      setBoneRotation(bones.rightLowerLeg, kneeR, 0, 0);
-      setBoneRotation(bones.leftFoot, -kneeL * 0.62 - stride * 0.22, 0, 0);
-      setBoneRotation(bones.rightFoot, -kneeR * 0.62 - counter * 0.22, 0, 0);
-      // Attack animation: pick two keyframe poses per segment, slerp between
-      // them, and blend the whole layer in/out. Punch = right cross, combo =
-      // left jab into right cross, kick = chambered right-leg snap.
-      let attackBlend = 0;
-      let twist = 0;
-      let leanBack = 0;
-      let poseA: PoseMap | undefined;
-      let poseB: PoseMap | undefined;
-      let segmentT = 0;
+      // --- animation ----------------------------------------------------------
+      // Every pose comes from a clip baked into the GLB: Battle_Idle standing,
+      // Walk / Run moving, and one-shot clips for attacks, damage and death.
       if (attackTime > 0 && attackMode) {
         attackTime = Math.max(0, attackTime - delta);
-        const p = 1 - attackTime / ATTACK_DURATIONS[attackMode];
-        if (attackMode === "punch") {
-          poseA = windupPose; poseB = strikePose;
-          if (chainedPunch) {
-            // Chained mining swing: start from the extended strike, draw back
-            // to the windup, then punch out again — no snap back to idle.
-            if (p < 0.34) { segmentT = 2 + p / 0.34; attackBlend = 1; }
-            else if (p < 0.66) { segmentT = 3 - (p - 0.34) / 0.32; attackBlend = 1; }
-            else if (p < 0.78) { segmentT = 2; attackBlend = 1; }
-            else { segmentT = 2; attackBlend = (1 - p) / 0.22; }
-            const k = segmentT <= 2 ? segmentT : 4 - segmentT;
-            twist = (k - 1) * 0.3 * attackBlend;
-          } else {
-            if (p < 0.26) { segmentT = p / 0.26; attackBlend = segmentT; }
-            else if (p < 0.5) { segmentT = 1 + (p - 0.26) / 0.24; attackBlend = 1; }
-            else if (p < 0.68) { segmentT = 2; attackBlend = 1; }
-            else { segmentT = 2; attackBlend = (1 - p) / 0.32; }
-            twist = (Math.min(segmentT, 2) - 1) * 0.3 * attackBlend;
-          }
-        } else if (attackMode === "combo") {
-          // Two-stage: jab (p 0..0.45) then cross (p 0.45..1).
-          if (p < 0.12) { segmentT = p / 0.12; attackBlend = segmentT; poseA = jabWindupPose; poseB = jabStrikePose; twist = -segmentT * 0.28 * attackBlend; }
-          else if (p < 0.3) { segmentT = 1 + (p - 0.12) / 0.18; attackBlend = 1; poseA = jabWindupPose; poseB = jabStrikePose; twist = (Math.min(segmentT, 2) - 1) * -0.28; }
-          else if (p < 0.45) { segmentT = 2; attackBlend = 1; poseA = jabWindupPose; poseB = jabStrikePose; twist = -0.28 * (1 - (p - 0.3) / 0.15); }
-          else if (p < 0.58) { segmentT = (p - 0.45) / 0.13; attackBlend = 1; poseA = windupPose; poseB = strikePose; twist = (segmentT - 1) * 0.38; }
-          else if (p < 0.74) { segmentT = 1 + (p - 0.58) / 0.16; attackBlend = 1; poseA = windupPose; poseB = strikePose; twist = (Math.min(segmentT, 2) - 1) * 0.38; }
-          else { segmentT = 2; attackBlend = (1 - p) / 0.26; poseA = windupPose; poseB = strikePose; twist = 0.38 * attackBlend; }
-        } else {
-          // Kick.
-          if (p < 0.3) { segmentT = p / 0.3; attackBlend = Math.min(1, segmentT * 1.4); poseA = kickWindupPose; poseB = kickStrikePose; }
-          else if (p < 0.48) { segmentT = 1 + (p - 0.3) / 0.18; attackBlend = 1; poseA = kickWindupPose; poseB = kickStrikePose; }
-          else if (p < 0.62) { segmentT = 2; attackBlend = 1; poseA = kickWindupPose; poseB = kickStrikePose; }
-          else { segmentT = 2; attackBlend = (1 - p) / 0.38; poseA = kickWindupPose; poseB = kickStrikePose; }
-          const k = Math.min(segmentT, 2);
-          leanBack = (k <= 1 ? -0.12 * k : -0.12 - 0.16 * (k - 1)) * attackBlend;
-          twist = -0.18 * (k <= 1 ? k : 2 - k) * attackBlend;
-        }
-        // Landing frames chip away at the targeted block instead of breaking it.
-        const hitPoint = attackMode === "combo" ? (pendingHits === 2 ? 0.3 : 0.74) : attackMode === "kick" ? 0.48 : chainedPunch ? 0.66 : 0.5;
+        const total = ATTACK_DURATIONS[attackMode];
+        const p = total > 0 ? 1 - attackTime / total : 1;
+        // The moment in the clip where the blow lands.
+        const hitPoint =
+          attackMode === "combo"
+            ? pendingHits === 2
+              ? 0.32
+              : 0.7
+            : attackMode === "guard"
+              ? 0.45
+              : 0.5;
         if (pendingHits > 0 && p >= hitPoint) {
           pendingHits -= 1;
           let hitPlayer = false;
@@ -1418,90 +1332,27 @@ export default function TerrainGame({
           // A player absorbs the strike; do not also damage the block behind them.
           if (!hitPlayer) attackBonus += 0.3;
         }
-
         if (attackTime === 0) {
           attackMode = null;
-          chainedPunch = false;
           setAttackLabel(null);
         }
       }
 
-      // The standing pose is baked into the rest rotations, so only layer the
-      // walk swing (left arm) and a light idle sway on top of it.
-      const swingScale = 1 - attackBlend;
-      setBoneRotation(bones.leftUpperArm, 0, (counter * 0.42 - idleSway * 0.018) * swingScale, 0);
-      setBoneRotation(bones.rightUpperArm, 0, idleSway * 0.012 * swingScale, 0);
-      setBoneRotation(bones.leftLowerArm, 0, -Math.max(0, -counter) * 0.14 * swingScale, 0);
-      setBoneRotation(bones.rightLowerArm, 0, 0, 0);
-      // Kicks drive the legs too, so fade the walk cycle out of the way.
-      if (attackMode === "kick" && attackBlend > 0) {
-        const restLegs = [bones.leftUpperLeg, bones.rightUpperLeg, bones.leftLowerLeg, bones.rightLowerLeg, bones.leftFoot, bones.rightFoot];
-        restLegs.forEach((bone) => {
-          const rest = bone && restRotations.get(bone);
-          if (bone && rest) bone.quaternion.slerp(rest, attackBlend);
-        });
+      if (!dying) {
+        animator?.setLocomotion(speed > 0 ? (sprinting ? CLIPS.run : CLIPS.walk) : CLIPS.idle);
       }
-      if (attackBlend > 0 && poseA && poseB) {
-        const target = new THREE.Quaternion();
-        poseA.forEach((windup, bone) => {
-          const strike = poseB!.get(bone);
-          const rest = restRotations.get(bone);
-          if (!strike || !rest) return;
-          if (segmentT <= 1) target.copy(rest).slerp(windup, segmentT);
-          else if (segmentT <= 2) target.copy(windup).slerp(strike, segmentT - 1);
-          else target.copy(strike).slerp(windup, segmentT - 2);
-          bone.quaternion.slerp(target, attackBlend);
-        });
-      }
+      animator?.update(delta);
 
-      airborneBlend = THREE.MathUtils.lerp(
-        airborneBlend,
-        grounded ? 0 : 1,
-        1 - Math.exp(-delta * (grounded ? 14 : 16)),
+      // Step rhythm kept for the secondary (hair / cloth) spring bones.
+      locomotionBlend = THREE.MathUtils.lerp(
+        locomotionBlend,
+        speed > 0 ? 1 : 0,
+        1 - Math.exp(-delta * (speed > 0 ? 9 : 7)),
       );
-      // Jump pose: hips, thighs, knees and feet all move. Knees tuck up on the
-      // way up, then the legs reach down for the landing on the way down.
-      let jumpLean = 0;
-      if (airborneBlend > 0.001) {
-        const rise = THREE.MathUtils.clamp(verticalVelocity / 5.4, 0, 1);
-        const fall = THREE.MathUtils.clamp(-verticalVelocity / 5.4, 0, 1);
-        const blend = airborneBlend;
-        jumpLean = (0.16 * rise - 0.1 * fall) * blend;
-        const blendBone = (bone: THREE.Object3D | undefined, x: number, y = 0, z = 0) => {
-          if (!bone) return;
-          const rest = restRotations.get(bone);
-          if (!rest) return;
-          const target = rest
-            .clone()
-            .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(x, y, z)));
-          bone.quaternion.slerp(target, blend);
-        };
-        // Lead leg tucks high, trail leg trails behind and straightens sooner.
-        blendBone(bones.leftUpperLeg, 0.85 * rise + 0.1 * fall, 0, -0.14);
-        blendBone(bones.rightUpperLeg, 0.42 * rise - 0.3 * fall, 0, 0.14);
-        blendBone(bones.leftLowerLeg, 1.15 * rise + 0.3 * fall, 0, 0);
-        blendBone(bones.rightLowerLeg, 0.7 * rise + 0.55 * fall, 0, 0);
-        blendBone(bones.leftFoot, -0.4 * rise + 0.25 * fall, 0, 0);
-        blendBone(bones.rightFoot, -0.5 * rise + 0.15 * fall, 0, 0);
-        if (airbornePose) {
-          airbornePose.forEach((quaternion, bone) => {
-            bone.quaternion.slerp(quaternion, blend);
-          });
-        }
-      }
-
-      setBoneRotation(bones.hips, settle + leanBack * 0.4 + jumpLean * 0.5, gait * 0.045 * locomotion + twist * 0.5, Math.cos(walkTime) * 0.032 * locomotion + idleSway * 0.018);
-      setBoneRotation(bones.spine, -settle * 0.5 + leanBack - jumpLean, -gait * 0.032 * locomotion + twist * 0.7, -Math.cos(walkTime) * 0.018 * locomotion - idleSway * 0.012);
-      setBoneRotation(bones.chest, settle * 0.65 - jumpLean * 0.6, Math.sin(walkTime) * 0.025 * locomotion + twist * 0.5, idleSway * 0.007);
-      setBoneRotation(bones.head, -settle * 0.35 + jumpLean * 0.4, twist * 0.3, -idleSway * 0.006);
-
+      if (speed > 0) walkTime += delta * (sprinting ? 10.5 : 7.2);
 
       visualStepOffset = THREE.MathUtils.lerp(visualStepOffset, 0, 1 - Math.exp(-delta * 11));
-      if (model) {
-        model.position.y = modelBaseY
-          + visualStepOffset
-          + (speed > 0 ? Math.abs(Math.sin(walkTime * 2)) * 0.024 * locomotion : settle * 0.16);
-      }
+      if (model) model.position.y = modelBaseY + visualStepOffset;
 
       const acceleration = (speed - previousSpeed) / Math.max(delta, 0.001);
       previousSpeed = THREE.MathUtils.lerp(previousSpeed, speed, Math.min(1, delta * 8));
@@ -1556,10 +1407,24 @@ export default function TerrainGame({
       landingImpact = 0;
 
       const target = character.position.clone().add(new THREE.Vector3(0, 1.05, 0));
+      // The head is only in the way in first person: shrink it there, restore
+      // it everywhere else.
+      if (headBone) {
+        const wanted = firstPersonView ? headRestScale * 0.001 : headRestScale;
+        if (headBone.scale.x !== wanted) headBone.scale.setScalar(wanted);
+      }
       if (firstPersonView) {
-        // Place the view just ahead of the face so looking down reveals the body.
-        const eye = character.position.clone().add(new THREE.Vector3(0, 1.5, 0));
-        eye.add(new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw)).multiplyScalar(0.13));
+        // Sit the camera on the head bone itself so the view follows the body.
+        const eye = new THREE.Vector3();
+        if (headBone) {
+          headBone.updateWorldMatrix(true, false);
+          headBone.getWorldPosition(eye);
+          eye.y += 0.1;
+        } else {
+          eye.copy(character.position).add(new THREE.Vector3(0, 1.6, 0));
+        }
+        // Nudge forward past the face so the chest doesn't fill the screen.
+        eye.add(new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw)).multiplyScalar(0.18));
         camera.position.copy(eye);
         const look = eye.clone().add(new THREE.Vector3(
           -Math.sin(cameraYaw) * Math.cos(cameraPitch),
@@ -1617,13 +1482,14 @@ export default function TerrainGame({
       // animation loops without dropping back to idle between swings. Chained
       // swings use the reversed timeline so the arm travels strike -> windup
       // -> strike instead of snapping.
-      const punchRecovery = ATTACK_DURATIONS.punch * 0.32;
-      if (miningHeld && miningBlock && (attackTime === 0 || (attackMode === "punch" && attackTime <= punchRecovery))) {
-        chainedPunch = attackMode === "punch" && attackTime > 0;
-        attackMode = "punch";
-        attackTime = ATTACK_DURATIONS.punch;
-        pendingHits = 1;
-        setAttackLabel("PUNCH");
+      const swingRecovery = ATTACK_DURATIONS.skill * 0.35;
+      if (
+        !dying &&
+        miningHeld &&
+        miningBlock &&
+        (attackTime === 0 || (attackMode === "skill" && attackTime <= swingRecovery))
+      ) {
+        startAttack("skill");
       }
       if (miningBlock && (miningHeld || attackBonus > 0)) {
         const miningType = world.blockTypeAt(miningBlock);
@@ -1777,6 +1643,7 @@ export default function TerrainGame({
       renderer.domElement.removeEventListener("wheel", onWheel);
       link?.dispose();
       linkRef.current = null;
+      animator?.dispose();
       remotePlayers.dispose();
       world.dispose();
       renderer.dispose();
