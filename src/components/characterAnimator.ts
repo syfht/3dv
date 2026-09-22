@@ -3,24 +3,30 @@ import * as THREE from "three";
 // Plays the animation clips that ship inside the character GLB. Nothing here
 // is hand-authored: every pose comes from a named clip in the model.
 //
-// Locomotion clips loop (Battle_Idle / Walk / Run) and one-shot clips
+// Locomotion clips loop (Battle_Idle / Walk / Back_Walk / Run) and one-shot clips
 // (attacks, damage reactions, death) play once on top, fading the locomotion
 // layer out and back in around them.
 
 export const CLIPS = {
   idle: "Battle_Idle",
   walk: "Walk",
+  backWalk: "Back_Walk",
   run: "Run",
   skill: "Skill_06",
-  combo: "Combo_02",
+  combo1: "Combo_01",
+  combo2: "Combo_02",
+  combo3: "Combo_03",
+  combo31: "Combo_03_1",
   guardCounter: "Guard_Counter",
+  guard: "Guard",
   jump: "Combo_04",
+  roll: "Roll",
   damageA: "Damage_A",
   damageC: "Damage_C",
   dead: "Dead_A",
 } as const;
 
-export type LocomotionClip = typeof CLIPS.idle | typeof CLIPS.walk | typeof CLIPS.run;
+export type LocomotionClip = typeof CLIPS.idle | typeof CLIPS.walk | typeof CLIPS.backWalk | typeof CLIPS.run;
 
 export function randomDamageClip() {
   return Math.random() < 0.5 ? CLIPS.damageA : CLIPS.damageC;
@@ -56,6 +62,7 @@ export function createCharacterAnimator(root: THREE.Object3D, clips: THREE.Anima
   let locomotionName: LocomotionClip = CLIPS.idle;
   let locomotion: THREE.AnimationAction | null = null;
   let oneShot: THREE.AnimationAction | null = null;
+  let oneShotName: string | null = null;
   let oneShotPriority = 0;
   let oneShotHold = false;
 
@@ -89,6 +96,7 @@ export function createCharacterAnimator(root: THREE.Object3D, clips: THREE.Anima
     if (!oneShot) return;
     oneShot.fadeOut(fade);
     oneShot = null;
+    oneShotName = null;
     oneShotPriority = 0;
     oneShotHold = false;
     startLocomotion(fade);
@@ -119,13 +127,17 @@ export function createCharacterAnimator(root: THREE.Object3D, clips: THREE.Anima
     action.fadeIn(fade).play();
     locomotion?.fadeOut(fade);
     oneShot = action;
+    oneShotName = name;
     oneShotPriority = priority;
     oneShotHold = hold;
     return duration(name) / Math.max(timeScale, 0.001);
   };
 
   /** Drop a held one-shot (death) and blend back to locomotion. */
-  const release = (fade = 0.25) => endOneShot(fade);
+  const release = (fade = 0.25, name?: string) => {
+    if (name && oneShotName !== name) return;
+    endOneShot(fade);
+  };
 
   const update = (delta: number) => {
     if (!locomotion && !oneShot) startLocomotion(0);
@@ -146,6 +158,9 @@ export function createCharacterAnimator(root: THREE.Object3D, clips: THREE.Anima
     duration,
     dispose,
     has: (name: string) => byName.has(name),
+    get currentOneShot() {
+      return oneShotName;
+    },
     get busy() {
       return oneShot !== null;
     },
